@@ -2,6 +2,7 @@
 using Microsoft.Extensions.Logging;
 using Orleans;
 using Orleans.Concurrency;
+using Ray.Core.Abstractions;
 using Ray.Core.Configuration;
 using Ray.Core.Event;
 using Ray.Core.Exceptions;
@@ -38,13 +39,13 @@ namespace Ray.Core
             }).ToList();
             var dynamicMethod = new DynamicMethod($"Handler_Invoke", typeof(Task), new Type[] { typeof(object), typeof(IEvent), typeof(EventBase) }, GrainType, true);
             var ilGen = dynamicMethod.GetILGenerator();
-            var items = new List<SwitchMethodEmit>();
+            var switchMethods = new List<SwitchMethodEmit>();
             for (int i = 0; i < methods.Count; i++)
             {
                 var method = methods[i];
                 var methodParams = method.GetParameters();
                 var caseType = methodParams.Single(p => typeof(IEvent).IsAssignableFrom(p.ParameterType)).ParameterType;
-                items.Add(new SwitchMethodEmit
+                switchMethods.Add(new SwitchMethodEmit
                 {
                     Mehod = method,
                     CaseType = caseType,
@@ -54,17 +55,33 @@ namespace Ray.Core
                     Index = i
                 });
             }
+            var sortList = new List<SwitchMethodEmit>();
+            foreach (var item in switchMethods.Where(m => m.CaseType.BaseType is object))
+            {
+                sortList.Add(item);
+                GetInheritor(item, switchMethods, sortList);
+            }
+            sortList.Reverse();
             var defaultLabel = ilGen.DefineLabel();
             var lastLable = ilGen.DefineLabel();
             var declare_1 = ilGen.DeclareLocal(typeof(Task));
-            foreach (var item in items)
+            var isShort = sortList.Count < 12;
+            foreach (var item in sortList)
             {
                 ilGen.Emit(OpCodes.Ldarg_1);
                 ilGen.Emit(OpCodes.Isinst, item.CaseType);
                 if (item.Index > 3)
                 {
-                    ilGen.Emit(OpCodes.Stloc_S, item.DeclareLocal);
-                    ilGen.Emit(OpCodes.Ldloc_S, item.DeclareLocal);
+                    if (isShort)
+                    {
+                        ilGen.Emit(OpCodes.Stloc_S, item.DeclareLocal);
+                        ilGen.Emit(OpCodes.Ldloc_S, item.DeclareLocal);
+                    }
+                    else
+                    {
+                        ilGen.Emit(OpCodes.Stloc, item.DeclareLocal);
+                        ilGen.Emit(OpCodes.Ldloc, item.DeclareLocal);
+                    }
                 }
                 else
                 {
@@ -90,47 +107,72 @@ namespace Ray.Core
                     }
                 }
 
-                ilGen.Emit(OpCodes.Brtrue_S, item.Lable);
+                ilGen.Emit(OpCodes.Brtrue, item.Lable);
             }
-            ilGen.Emit(OpCodes.Br_S, defaultLabel);
-            foreach (var item in items)
+            if (isShort)
+                ilGen.Emit(OpCodes.Br_S, defaultLabel);
+            else
+                ilGen.Emit(OpCodes.Br, defaultLabel);
+            foreach (var item in sortList)
             {
                 ilGen.MarkLabel(item.Lable);
                 ilGen.Emit(OpCodes.Ldarg_0);
                 //加载第一个参数
                 if (item.Parameters[0].ParameterType == item.CaseType)
-                    LdEventArgs(item, ilGen);
+                    LdEventArgs(item, ilGen, isShort);
                 else if (item.Parameters[0].ParameterType == typeof(EventBase))
                     ilGen.Emit(OpCodes.Ldarg_2);
                 //加载第二个参数
                 if (item.Parameters.Length == 2)
                 {
                     if (item.Parameters[1].ParameterType == item.CaseType)
-                        LdEventArgs(item, ilGen);
+                        LdEventArgs(item, ilGen, isShort);
                     else if (item.Parameters[1].ParameterType == typeof(EventBase))
                         ilGen.Emit(OpCodes.Ldarg_2);
                 }
                 ilGen.Emit(OpCodes.Call, item.Mehod);
-                ilGen.Emit(OpCodes.Stloc_S, declare_1);
-                ilGen.Emit(OpCodes.Br_S, lastLable);
+                if (isShort)
+                {
+                    ilGen.Emit(OpCodes.Stloc_S, declare_1);
+                    ilGen.Emit(OpCodes.Br_S, lastLable);
+                }
+                else
+                {
+                    ilGen.Emit(OpCodes.Stloc, declare_1);
+                    ilGen.Emit(OpCodes.Br, lastLable);
+                }
             }
             ilGen.MarkLabel(defaultLabel);
             ilGen.Emit(OpCodes.Ldarg_0);
             ilGen.Emit(OpCodes.Ldarg_1);
             ilGen.Emit(OpCodes.Call, GrainType.GetMethod(nameof(DefaultHandler)));
-            ilGen.Emit(OpCodes.Stloc_S, declare_1);
-            ilGen.Emit(OpCodes.Br_S, lastLable);
+            if (isShort)
+            {
+                ilGen.Emit(OpCodes.Stloc_S, declare_1);
+                ilGen.Emit(OpCodes.Br_S, lastLable);
+            }
+            else
+            {
+                ilGen.Emit(OpCodes.Stloc, declare_1);
+                ilGen.Emit(OpCodes.Br, lastLable);
+            }
             //last
             ilGen.MarkLabel(lastLable);
-            ilGen.Emit(OpCodes.Ldloc_S, declare_1);
+            if (isShort)
+                ilGen.Emit(OpCodes.Ldloc_S, declare_1);
+            else
+                ilGen.Emit(OpCodes.Ldloc, declare_1);
             ilGen.Emit(OpCodes.Ret);
             handlerInvokeFunc = (Func<object, IEvent, EventBase, Task>)dynamicMethod.CreateDelegate(typeof(Func<object, IEvent, EventBase, Task>));
             //加载Event参数
-            static void LdEventArgs(SwitchMethodEmit item, ILGenerator gen)
+            static void LdEventArgs(SwitchMethodEmit item, ILGenerator gen, bool isShort)
             {
                 if (item.Index > 3)
                 {
-                    gen.Emit(OpCodes.Ldloc_S, item.DeclareLocal);
+                    if (isShort)
+                        gen.Emit(OpCodes.Ldloc_S, item.DeclareLocal);
+                    else
+                        gen.Emit(OpCodes.Ldloc, item.DeclareLocal);
                 }
                 else
                 {
@@ -150,6 +192,15 @@ namespace Ray.Core
                     {
                         gen.Emit(OpCodes.Ldloc_3);
                     }
+                }
+            }
+            static void GetInheritor(SwitchMethodEmit from, List<SwitchMethodEmit> list, List<SwitchMethodEmit> result)
+            {
+                var inheritorList = list.Where(m => m.CaseType.BaseType == from.CaseType);
+                foreach (var inheritor in inheritorList)
+                {
+                    result.Add(inheritor);
+                    GetInheritor(inheritor, list, result);
                 }
             }
         }
@@ -182,6 +233,7 @@ namespace Ray.Core
         protected CoreOptions ConfigOptions { get; private set; }
         protected ILogger Logger { get; private set; }
         protected ISerializer Serializer { get; private set; }
+        protected ITypeFinder TypeFinder { get; private set; }
         /// <summary>
         /// Memory state, restored by snapshot + Event play or replay
         /// </summary>
@@ -222,6 +274,7 @@ namespace Ray.Core
         {
             ConfigOptions = ServiceProvider.GetOptionsByName<CoreOptions>(typeof(MainGrain).FullName);
             Serializer = ServiceProvider.GetService<ISerializer>();
+            TypeFinder = ServiceProvider.GetService<ITypeFinder>();
             Logger = (ILogger)ServiceProvider.GetService(typeof(ILogger<>).MakeGenericType(GrainType));
             var configureBuilder = ServiceProvider.GetService<IConfigureBuilder<PrimaryKey, MainGrain>>();
             var storageConfigTask = configureBuilder.GetConfig(ServiceProvider, GrainId);
@@ -367,7 +420,7 @@ namespace Ray.Core
                       var (success, transport) = EventBytesTransport.FromBytesWithNoId(bytes);
                       if (success)
                       {
-                          var msgType = TypeContainer.GetType(transport.EventTypeCode);
+                          var msgType = TypeFinder.FindType(transport.EventTypeCode);
                           var data = Serializer.Deserialize(transport.EventBytes, msgType);
                           if (data is IEvent @event)
                           {
@@ -412,7 +465,7 @@ namespace Ray.Core
             var (success, transport) = EventBytesTransport.FromBytesWithNoId(bytes);
             if (success)
             {
-                var msgType = TypeContainer.GetType(transport.EventTypeCode);
+                var msgType = TypeFinder.FindType(transport.EventTypeCode);
                 var data = Serializer.Deserialize(transport.EventBytes, msgType);
                 if (data is IEvent @event)
                 {
@@ -525,11 +578,12 @@ namespace Ray.Core
             }
             if (UnprocessedEventList.Count > 0)
             {
-                await Task.WhenAll(UnprocessedEventList.Select(async @event =>
+                await Task.WhenAll(UnprocessedEventList.Select(@event =>
                 {
                     var task = EventDelivered(@event);
                     if (!task.IsCompletedSuccessfully)
-                        await task;
+                        return task.AsTask();
+                    return Task.CompletedTask;
                 }));
                 Snapshot.UnsafeUpdateVersion(UnprocessedEventList.Last().Base);
                 var saveTask = SaveSnapshotAsync();

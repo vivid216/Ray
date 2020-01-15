@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Linq;
 using Microsoft.Extensions.DependencyInjection;
-using Ray.Core.Abstractions;
+using Ray.Core.Utils;
 
 namespace Ray.Core.Snapshot
 {
@@ -9,7 +9,7 @@ namespace Ray.Core.Snapshot
     {
         public static void AutoAddSnapshotHandler(this IServiceCollection serviceCollection)
         {
-            foreach (var assembly in AssembliesRuntimeHelper.GetAssemblies())
+            foreach (var assembly in AssemblyHelper.GetAssemblies())
             {
                 foreach (var type in assembly.GetTypes())
                 {

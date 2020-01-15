@@ -30,6 +30,7 @@ namespace Ray.Core
         protected ILogger Logger { get; private set; }
         protected IProducerContainer ProducerContainer { get; private set; }
         protected ISerializer Serializer { get; private set; }
+        protected ITypeFinder TypeFinder { get; private set; }
         protected Snapshot<PrimaryKey, StateType> Snapshot { get; set; }
         protected ISnapshotHandler<PrimaryKey, StateType> SnapshotHandler { get; private set; }
         protected IObserverUnit<PrimaryKey> ObserverUnit { get; private set; }
@@ -97,7 +98,10 @@ namespace Ray.Core
             Logger = (ILogger)ServiceProvider.GetService(typeof(ILogger<>).MakeGenericType(GrainType));
             ProducerContainer = ServiceProvider.GetService<IProducerContainer>();
             Serializer = ServiceProvider.GetService<ISerializer>();
+            TypeFinder = ServiceProvider.GetService<ITypeFinder>();
             SnapshotHandler = ServiceProvider.GetService<ISnapshotHandler<PrimaryKey, StateType>>();
+            if (SnapshotHandler == default)
+                throw new UnfindSnapshotHandlerException(GrainType);
             ObserverUnit = ServiceProvider.GetService<IObserverUnitContainer>().GetUnit<PrimaryKey>(GrainType);
             ObserverEventHandlers = ObserverUnit.GetAllEventHandlers();
             var configureBuilder = (IConfigureBuilder<PrimaryKey>)ServiceProvider.GetService(typeof(IConfigureBuilder<,>).MakeGenericType(typeof(PrimaryKey), GrainType));
@@ -337,13 +341,13 @@ namespace Ray.Core
                 }
             }
         }
-        protected async Task Over()
+        protected async Task Over(OverType overType)
         {
             if (Snapshot.Base.IsOver)
                 throw new StateIsOverException(Snapshot.Base.StateId.ToString(), GrainType);
             if (Snapshot.Base.Version != Snapshot.Base.DoingVersion)
                 throw new StateInsecurityException(Snapshot.Base.StateId.ToString(), GrainType, Snapshot.Base.DoingVersion, Snapshot.Base.Version);
-            if (ArchiveOptions.On && ArchiveOptions.ArchiveEventOnOver)
+            if (overType != OverType.None)
             {
                 var versions = await ObserverUnit.GetAndSaveVersion(Snapshot.Base.StateId, Snapshot.Base.Version);
                 if (versions.Any(v => v < Snapshot.Base.Version))
@@ -363,18 +367,35 @@ namespace Ray.Core
             {
                 await SnapshotStorage.Over(Snapshot.Base.StateId, true);
             }
-            if (ArchiveOptions.On && ArchiveOptions.ArchiveEventOnOver)
+            if (overType == OverType.ArchivingEvent)
             {
-                await ArchiveStorage.DeleteAll(Snapshot.Base.StateId);
-                if (ArchiveOptions.EventArchiveType == EventArchiveType.Delete)
-                    await EventStorage.DeletePrevious(Snapshot.Base.StateId, Snapshot.Base.Version, Snapshot.Base.StartTimestamp);
-                else
-                    await ArchiveStorage.EventArichive(Snapshot.Base.StateId, Snapshot.Base.Version, Snapshot.Base.StartTimestamp);
+                if (ArchiveOptions.On)
+                    await DeleteAllArchive();
+                await ArchiveStorage.EventArichive(Snapshot.Base.StateId, Snapshot.Base.Version, Snapshot.Base.StartTimestamp);
             }
-            else
+            else if (overType == OverType.DeleteEvent)
+            {
+                if (ArchiveOptions.On)
+                    await DeleteAllArchive();
+                await EventStorage.DeletePrevious(Snapshot.Base.StateId, Snapshot.Base.Version, Snapshot.Base.StartTimestamp);
+            }
+            else if (overType == OverType.DeleteAll)
+            {
+                if (ArchiveOptions.On)
+                    await DeleteAllArchive();
+                await EventStorage.DeletePrevious(Snapshot.Base.StateId, Snapshot.Base.Version, Snapshot.Base.StartTimestamp);
+
+                if (SnapshotEventVersion > 0)
+                {
+                    await SnapshotStorage.Delete(GrainId);
+                    SnapshotEventVersion = 0;
+                }
+            }
+            else if (ArchiveOptions.On && BriefArchiveList.Count > 0)
             {
                 await ArchiveStorage.Over(Snapshot.Base.StateId, true);
             }
+
         }
         private async Task DeleteArchive(string briefId)
         {
@@ -383,12 +404,15 @@ namespace Ray.Core
             if (!task.IsCompletedSuccessfully)
                 await task;
         }
-        private async Task DeleteAllArchive()
+        protected async Task DeleteAllArchive()
         {
-            await DeleteAllArchive();
-            var task = OnStartDeleteAllArchive();
-            if (!task.IsCompletedSuccessfully)
-                await task;
+            if (BriefArchiveList.Count > 0)
+            {
+                var task = OnStartDeleteAllArchive();
+                if (!task.IsCompletedSuccessfully)
+                    await task;
+                await ArchiveStorage.DeleteAll(GrainId);
+            }
         }
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         protected virtual ValueTask OnStartSaveSnapshot() => Consts.ValueTaskDone;
@@ -451,7 +475,7 @@ namespace Ray.Core
                 Snapshot.Base.IncrementDoingVersion(GrainType);//标记将要处理的Version
                 var evtType = @event.GetType();
                 var bytesTransport = new EventBytesTransport(
-                   TypeContainer.GetTypeCode(evtType),
+                   TypeFinder.GetCode(evtType),
                     Snapshot.Base.StateId,
                     fullyEvent.Base.GetBytes(),
                     Serializer.SerializeToUtf8Bytes(@event, evtType)
@@ -711,7 +735,7 @@ namespace Ray.Core
                 hashKey = GrainId.ToString();
             try
             {
-                var wrapper = new CommonTransport(TypeContainer.GetTypeCode(msg.GetType()), Serializer.SerializeToUtf8Bytes(msg, msg.GetType()));
+                var wrapper = new CommonTransport(TypeFinder.GetCode(msg.GetType()), Serializer.SerializeToUtf8Bytes(msg, msg.GetType()));
                 var pubLishTask = EventBusProducer.Publish(wrapper.GetBytes(), hashKey);
                 if (!pubLishTask.IsCompletedSuccessfully)
                     await pubLishTask;
